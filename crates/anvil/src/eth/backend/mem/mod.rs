@@ -53,20 +53,18 @@ use ethers::{
         DefaultFrame, Filter, FilteredParams, GethDebugTracingOptions, GethTrace, Log, OtherFields,
         Trace, Transaction, TransactionReceipt, H160,
     },
-    utils::{hex, keccak256, rlp},
+    utils::{keccak256, rlp},
 };
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use foundry_evm::{
-    decode::{decode_custom_error_args, decode_revert},
-    executor::{
-        backend::{DatabaseError, DatabaseResult},
-        inspector::AccessListTracer,
-        DEFAULT_CREATE2_DEPLOYER_RUNTIME_CODE,
-    },
+    backend::{DatabaseError, DatabaseResult},
+    constants::DEFAULT_CREATE2_DEPLOYER_RUNTIME_CODE,
+    decode::decode_revert,
+    inspectors::AccessListTracer,
     revm::{
         self,
         db::CacheDB,
-        interpreter::{return_ok, InstructionResult},
+        interpreter::InstructionResult,
         primitives::{
             Account, BlockEnv, CreateScheme, EVMError, Env, ExecutionResult, InvalidHeader, Output,
             SpecId, TransactTo, TxEnv, KECCAK_EMPTY,
@@ -102,7 +100,8 @@ pub const MIN_TRANSACTION_GAS: U256 = U256([21_000, 0, 0, 0]);
 // Gas per transaction creating a contract.
 pub const MIN_CREATE_GAS: U256 = U256([53_000, 0, 0, 0]);
 
-pub type State = foundry_evm::HashMap<Address, Account>;
+// TODO: This is the same as foundry_evm::utils::StateChangeset but with ethers H160
+pub type State = foundry_evm::hashbrown::HashMap<Address, Account>;
 
 /// A block request, which includes the Pool Transactions if it's Pending
 #[derive(Debug)]
@@ -285,7 +284,7 @@ impl Backend {
             fork_genesis_infos.clear();
 
             for res in genesis_accounts {
-                let (address, mut info) = res??;
+                let (address, mut info) = res.map_err(DatabaseError::display)??;
                 info.balance = self.genesis.balance;
                 db.insert_account(address, info.clone());
 
@@ -659,11 +658,22 @@ impl Backend {
             let block =
                 self.block_by_hash(best_block_hash).await?.ok_or(BlockchainError::BlockNotFound)?;
 
-            // Note: In [`TimeManager::compute_next_timestamp`] we ensure that the next timestamp is
-            // always increasing by at least one. By subtracting 1 here, this is mitigated.
-            let reset_time = block.timestamp.as_u64().saturating_sub(1);
+            let reset_time = block.timestamp.as_u64();
             self.time.reset(reset_time);
-            self.set_block_number(num.into());
+
+            let mut env = self.env.write();
+            env.block = BlockEnv {
+                number: rU256::from(num),
+                timestamp: block.timestamp.to_alloy(),
+                difficulty: block.difficulty.to_alloy(),
+                // ensures prevrandao is set
+                prevrandao: Some(block.mix_hash.unwrap_or_default()).map(|h| h.to_alloy()),
+                gas_limit: block.gas_limit.to_alloy(),
+                // Keep previous `coinbase` and `basefee` value
+                coinbase: env.block.coinbase,
+                basefee: env.block.basefee,
+                ..Default::default()
+            };
         }
         Ok(self.db.write().await.revert(id))
     }
@@ -899,54 +909,20 @@ impl Backend {
             // insert all transactions
             for (info, receipt) in transactions.into_iter().zip(receipts) {
                 // log some tx info
-                {
-                    node_info!("    Transaction: {:?}", info.transaction_hash);
-                    if let Some(ref contract) = info.contract_address {
-                        node_info!("    Contract created: {:?}", contract);
-                    }
-                    node_info!("    Gas used: {}", receipt.gas_used());
-                    match info.exit {
-                        return_ok!() => (),
-                        InstructionResult::OutOfFund => {
-                            node_info!("    Error: reverted due to running out of funds");
-                        }
-                        InstructionResult::CallTooDeep => {
-                            node_info!("    Error: reverted with call too deep");
-                        }
-                        InstructionResult::Revert => {
-                            if let Some(ref r) = info.out {
-                                if let Ok(reason) = decode_revert(r.as_ref(), None, None) {
-                                    node_info!("    Error: reverted with '{}'", reason);
-                                } else {
-                                    match decode_custom_error_args(r, 5) {
-                                        // assuming max 5 args
-                                        Some(token) => {
-                                            node_info!(
-                                                "    Error: reverted with custom error: {:?}",
-                                                token
-                                            );
-                                        }
-                                        None => {
-                                            node_info!(
-                                                "    Error: reverted with custom error: {}",
-                                                hex::encode(r)
-                                            );
-                                        }
-                                    }
-                                }
-                            } else {
-                                node_info!("    Error: reverted without a reason");
-                            }
-                        }
-                        InstructionResult::OutOfGas => {
-                            node_info!("    Error: ran out of gas");
-                        }
-                        reason => {
-                            node_info!("    Error: failed due to {:?}", reason);
-                        }
-                    }
-                    node_info!("");
+                node_info!("    Transaction: {:?}", info.transaction_hash);
+                if let Some(contract) = &info.contract_address {
+                    node_info!("    Contract created: {contract:?}");
                 }
+                node_info!("    Gas used: {}", receipt.gas_used());
+                if !info.exit.is_ok() {
+                    let r = decode_revert(
+                        info.out.as_deref().unwrap_or_default(),
+                        None,
+                        Some(info.exit),
+                    );
+                    node_info!("    Error: reverted with: {r}");
+                }
+                node_info!("");
 
                 let mined_tx = MinedTransaction {
                     info,
@@ -957,19 +933,13 @@ impl Backend {
                 storage.transactions.insert(mined_tx.info.transaction_hash, mined_tx);
             }
 
+            // remove old transactions that exceed the transaction block keeper
             if let Some(transaction_block_keeper) = self.transaction_block_keeper {
                 if storage.blocks.len() > transaction_block_keeper {
-                    let n: U64 = block_number
+                    let to_clear = block_number
                         .as_u64()
-                        .saturating_sub(transaction_block_keeper.try_into().unwrap())
-                        .into();
-                    if let Some(hash) = storage.hashes.get(&n) {
-                        if let Some(block) = storage.blocks.get(hash) {
-                            for tx in block.clone().transactions {
-                                let _ = storage.transactions.remove(&tx.hash());
-                            }
-                        }
-                    }
+                        .saturating_sub(transaction_block_keeper.try_into().unwrap());
+                    storage.remove_block_transactions_by_number(to_clear)
                 }
             }
 
@@ -1158,7 +1128,7 @@ impl Backend {
                     (halt_to_instruction_result(reason), gas_used, None)
                 },
             };
-            let res = inspector.tracer.unwrap_or_default().traces.geth_trace(gas_used.into(), opts);
+            let res = inspector.tracer.unwrap_or_default().traces.geth_trace(rU256::from(gas_used), opts);
             trace!(target: "backend", "trace call return {:?} out: {:?} gas {} on block {}", exit_reason, out, gas_used, block_number);
             Ok(res)
         })

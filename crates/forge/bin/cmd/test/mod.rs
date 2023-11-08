@@ -1,14 +1,13 @@
 use super::{install, test::filter::ProjectPathsAwareFilter, watch::WatchArgs};
 use alloy_primitives::U256;
 use clap::Parser;
-
 use eyre::Result;
 use forge::{
     decode::decode_console_logs,
-    executor::inspector::CheatsConfig,
     gas_report::GasReport,
+    inspectors::CheatsConfig,
     result::{SuiteResult, TestResult, TestStatus},
-    trace::{
+    traces::{
         identifier::{EtherscanIdentifier, LocalTraceIdentifier, SignaturesIdentifier},
         CallTraceDecoderBuilder, TraceKind,
     },
@@ -96,7 +95,7 @@ pub struct TestArgs {
     list: bool,
 
     /// Set seed used to generate randomness during your fuzz runs.
-    #[clap(long, value_parser = utils::alloy_parse_u256)]
+    #[clap(long)]
     pub fuzz_seed: Option<U256>,
 
     #[clap(long, env = "FOUNDRY_FUZZ_RUNS", value_name = "RUNS")]
@@ -197,7 +196,7 @@ impl TestArgs {
             .evm_spec(config.evm_spec_id())
             .sender(evm_opts.sender)
             .with_fork(evm_opts.get_fork(&config, env.clone()))
-            .with_cheats_config(CheatsConfig::new(&config, &evm_opts))
+            .with_cheats_config(CheatsConfig::new(&config, evm_opts.clone()))
             .with_test_options(test_options.clone());
 
         let mut runner = runner_builder.clone().build(
@@ -676,7 +675,7 @@ async fn test(
     let handle =
         tokio::task::spawn(async move { runner.test(filter, Some(tx), test_options).await });
 
-    let mut results: BTreeMap<String, SuiteResult> = BTreeMap::new();
+    let mut results = BTreeMap::new();
     let mut gas_report = GasReport::new(config.gas_reports, config.gas_reports_ignore);
     let sig_identifier = SignaturesIdentifier::new(Config::foundry_cache_dir(), config.offline)?;
 
@@ -808,7 +807,7 @@ async fn test(
         }
     }
 
-    // reattach the thread
+    // reattach the task
     let _results = handle.await?;
 
     trace!(target: "forge::test", "received {} results", results.len());

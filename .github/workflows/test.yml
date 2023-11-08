@@ -109,9 +109,7 @@ jobs:
               run: |
                   # see https://github.com/foundry-rs/foundry/pull/3959
                   export LD_LIBRARY_PATH="$(rustc --print sysroot)/lib"
-                  cargo nextest run \
-                    --retries 2 \
-                    --archive-file tests-${{ matrix.target }}.tar.zst \
+                  cargo nextest run --archive-file tests-${{ matrix.target }}.tar.zst \
                     ${{ matrix.flags }}
 
     doctests:
@@ -163,7 +161,12 @@ jobs:
               with:
                   cache-on-failure: true
             - name: forge fmt
-              run: cargo run --bin forge -- fmt --check testdata/
+              shell: bash
+              # We have to ignore at shell level because testdata/ is not a valid Foundry project,
+              # so running `forge fmt` with `--root testdata` won't actually check anything
+              run: |
+                  shopt -s extglob
+                  cargo run --bin forge -- fmt --check testdata/**/!(Vm).sol
 
     feature-checks:
         name: feature checks

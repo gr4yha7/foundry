@@ -1,4 +1,4 @@
-use ethers_core::types::{H256, U256, U64};
+use ethers_core::types::{TxHash, H256, U256, U64};
 use revm::primitives::SpecId;
 
 #[cfg(feature = "serde")]
@@ -23,6 +23,10 @@ impl<'de> serde::Deserialize<'de> for Forking {
         #[serde(rename_all = "camelCase")]
         struct ForkOpts {
             pub json_rpc_url: Option<String>,
+            #[serde(
+                default,
+                deserialize_with = "ethers_core::types::serde_helpers::deserialize_stringified_u64_opt"
+            )]
             pub block_number: Option<u64>,
         }
 
@@ -129,7 +133,7 @@ impl<'a> serde::Deserialize<'a> for Index {
         impl<'a> serde::de::Visitor<'a> for IndexVisitor {
             type Value = Index;
 
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 write!(formatter, "hex-encoded or decimal index")
             }
 
@@ -198,4 +202,51 @@ pub struct NodeForkConfig {
     pub fork_url: Option<String>,
     pub fork_block_number: Option<u64>,
     pub fork_retry_backoff: Option<u128>,
+}
+
+/// Anvil equivalent of `hardhat_metadata`.
+/// Metadata about the current Anvil instance.
+/// See <https://hardhat.org/hardhat-network/docs/reference#hardhat_metadata>
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+pub struct AnvilMetadata {
+    pub client_version: &'static str,
+    pub chain_id: U256,
+    pub instance_id: H256,
+    pub latest_block_number: U64,
+    pub latest_block_hash: H256,
+    pub forked_network: Option<ForkedNetwork>,
+}
+
+/// Information about the forked network.
+/// See <https://hardhat.org/hardhat-network/docs/reference#hardhat_metadata>
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+pub struct ForkedNetwork {
+    pub chain_id: U256,
+    pub fork_block_number: U64,
+    pub fork_block_hash: TxHash,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serde_forking() {
+        let s = r#"{"forking": {"jsonRpcUrl": "https://ethereumpublicnode.com",
+        "blockNumber": "18441649"
+      }
+    }"#;
+        let f: Forking = serde_json::from_str(s).unwrap();
+        assert_eq!(
+            f,
+            Forking {
+                json_rpc_url: Some("https://ethereumpublicnode.com".into()),
+                block_number: Some(18441649)
+            }
+        );
+    }
 }

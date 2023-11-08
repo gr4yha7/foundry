@@ -39,7 +39,10 @@ use anvil_core::{
         },
         EthRequest,
     },
-    types::{EvmMineOptions, Forking, Index, NodeEnvironment, NodeForkConfig, NodeInfo, Work},
+    types::{
+        AnvilMetadata, EvmMineOptions, ForkedNetwork, Forking, Index, NodeEnvironment,
+        NodeForkConfig, NodeInfo, Work,
+    },
 };
 use anvil_rpc::{error::RpcError, response::ResponseResult};
 use ethers::{
@@ -59,8 +62,9 @@ use ethers::{
 };
 use foundry_common::ProviderBuilder;
 use foundry_evm::{
-    executor::{backend::DatabaseError, DatabaseRef},
+    backend::DatabaseError,
     revm::{
+        db::DatabaseRef,
         interpreter::{return_ok, return_revert, InstructionResult},
         primitives::BlockEnv,
     },
@@ -107,6 +111,8 @@ pub struct EthApi {
     transaction_order: Arc<RwLock<TransactionOrder>>,
     /// Whether we're listening for RPC calls
     net_listening: bool,
+    /// The instance ID. Changes on every reset.
+    instance_id: Arc<RwLock<H256>>,
 }
 
 // === impl Eth RPC API ===
@@ -137,6 +143,7 @@ impl EthApi {
             filters,
             net_listening: true,
             transaction_order: Arc::new(RwLock::new(transactions_order)),
+            instance_id: Arc::new(RwLock::new(H256::random())),
         }
     }
 
@@ -314,6 +321,7 @@ impl EthApi {
             EthRequest::DumpState(_) => self.anvil_dump_state().await.to_rpc_result(),
             EthRequest::LoadState(buf) => self.anvil_load_state(buf).await.to_rpc_result(),
             EthRequest::NodeInfo(_) => self.anvil_node_info().await.to_rpc_result(),
+            EthRequest::AnvilMetadata(_) => self.anvil_metadata().await.to_rpc_result(),
             EthRequest::EvmSnapshot(_) => self.evm_snapshot().await.to_rpc_result(),
             EthRequest::EvmRevert(id) => self.evm_revert(id).await.to_rpc_result(),
             EthRequest::EvmIncreaseTime(time) => self.evm_increase_time(time).await.to_rpc_result(),
@@ -1531,6 +1539,8 @@ impl EthApi {
     pub async fn anvil_reset(&self, forking: Option<Forking>) -> Result<()> {
         node_info!("anvil_reset");
         if let Some(forking) = forking {
+            // if we're resetting the fork we need to reset the instance id
+            self.reset_instance_id();
             self.backend.reset_fork(forking).await
         } else {
             Err(BlockchainError::RpcUnimplemented)
@@ -1691,6 +1701,27 @@ impl EthApi {
                     }
                 })
                 .unwrap_or_default(),
+        })
+    }
+
+    /// Retrieves metadata about the Anvil instance.
+    ///
+    /// Handler for RPC call: `anvil_metadata`
+    pub async fn anvil_metadata(&self) -> Result<AnvilMetadata> {
+        node_info!("anvil_metadata");
+        let fork_config = self.backend.get_fork();
+
+        Ok(AnvilMetadata {
+            client_version: CLIENT_VERSION,
+            chain_id: self.backend.chain_id(),
+            latest_block_hash: self.backend.best_hash(),
+            latest_block_number: self.backend.best_number(),
+            instance_id: *self.instance_id.read(),
+            forked_network: fork_config.map(|cfg| ForkedNetwork {
+                chain_id: cfg.chain_id().into(),
+                fork_block_number: cfg.block_number().into(),
+                fork_block_hash: cfg.block_hash(),
+            }),
         })
     }
 
@@ -2160,7 +2191,8 @@ impl EthApi {
                 return Err(InvalidTransactionError::BasicOutOfGas(gas_limit).into())
             }
             // need to check if the revert was due to lack of gas or unrelated reason
-            return_revert!() => {
+            // we're also checking for InvalidFEOpcode here because this can be used to trigger an error <https://github.com/foundry-rs/foundry/issues/6138> common usage in openzeppelin <https://github.com/OpenZeppelin/openzeppelin-contracts/blob/94697be8a3f0dfcd95dfb13ffbd39b5973f5c65d/contracts/metatx/ERC2771Forwarder.sol#L360-L367>
+            return_revert!() | InstructionResult::InvalidFEOpcode => {
                 // if price or limit was included in the request then we can execute the request
                 // again with the max gas limit to check if revert is gas related or not
                 return if request.gas.is_some() || request.gas_price.is_some() {
@@ -2232,7 +2264,9 @@ impl EthApi {
                     // gas).
                     InstructionResult::Revert |
                     InstructionResult::OutOfGas |
-                    InstructionResult::OutOfFund => {
+                    InstructionResult::OutOfFund |
+                    // we're also checking for InvalidFEOpcode here because this can be used to trigger an error <https://github.com/foundry-rs/foundry/issues/6138> common usage in openzeppelin <https://github.com/OpenZeppelin/openzeppelin-contracts/blob/94697be8a3f0dfcd95dfb13ffbd39b5973f5c65d/contracts/metatx/ERC2771Forwarder.sol#L360-L367>
+                    InstructionResult::InvalidFEOpcode => {
                         lowest_gas_limit = mid_gas_limit;
                     }
                     // The tx failed for some other reason.
@@ -2274,6 +2308,16 @@ impl EthApi {
 
     pub fn get_fork(&self) -> Option<ClientFork> {
         self.backend.get_fork()
+    }
+
+    /// Returns the current instance's ID.
+    pub fn instance_id(&self) -> H256 {
+        *self.instance_id.read()
+    }
+
+    /// Resets the instance ID.
+    pub fn reset_instance_id(&self) {
+        *self.instance_id.write() = H256::random();
     }
 
     /// Returns the first signer that can sign for the given address
